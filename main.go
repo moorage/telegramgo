@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+  "path/filepath"
 
-	"github.com/shelomentsevd/mtproto"
+	"github.com/moorage/mtproto"
 )
 
 const updatePeriod = time.Second * 2
@@ -80,8 +80,8 @@ type TelegramCLI struct {
 	connected bool
 	reader    *bufio.Reader
 	users     map[int32]mtproto.TL_user
-	chats     map[int32]mtproto.TL_chat
-	channels  map[int32]mtproto.TL_channel
+	chats     map[int32]mtproto.Chat
+	channels  map[int32]mtproto.Channel
 }
 
 func NewTelegramCLI(pMTProto *mtproto.MTProto) (*TelegramCLI, error) {
@@ -94,8 +94,8 @@ func NewTelegramCLI(pMTProto *mtproto.MTProto) (*TelegramCLI, error) {
 	cli.stop = make(chan struct{}, 1)
 	cli.reader = bufio.NewReader(os.Stdin)
 	cli.users = make(map[int32]mtproto.TL_user)
-	cli.chats = make(map[int32]mtproto.TL_chat)
-	cli.channels = make(map[int32]mtproto.TL_channel)
+	cli.chats = make(map[int32]mtproto.Chat)
+	cli.channels = make(map[int32]mtproto.Channel)
 
 	return cli, nil
 }
@@ -104,19 +104,15 @@ func (cli *TelegramCLI) Authorization(phonenumber string) error {
 	if phonenumber == "" {
 		return fmt.Errorf("Phone number is empty")
 	}
-	sentCode, err := cli.mtproto.AuthSendCode(phonenumber)
+	phoneCodeHash, err := cli.mtproto.Auth_SendCode(phonenumber)
 	if err != nil {
 		return err
 	}
 
-	if !sentCode.Phone_registered {
-		return fmt.Errorf("Phone number isn't registered")
-	}
-
 	var code string
-	fmt.Printf("Enter code: ")
+	fmt.Printf("(phone code hash "+phoneCodeHash+") Enter code: ")
 	fmt.Scanf("%s", &code)
-	auth, err := cli.mtproto.AuthSignIn(phonenumber, code, sentCode.Phone_code_hash)
+	auth, err := cli.mtproto.Auth_SignIn(phonenumber, phoneCodeHash, code)
 	if err != nil {
 		return err
 	}
@@ -133,19 +129,13 @@ func (cli *TelegramCLI) Authorization(phonenumber string) error {
 
 // Load contacts to users map
 func (cli *TelegramCLI) LoadContacts() error {
-	tl, err := cli.mtproto.ContactsGetContacts("")
+	_, users, err := cli.mtproto.Contacts_GetContacts(0)
 	if err != nil {
 		return err
 	}
-	list, ok := (*tl).(mtproto.TL_contacts_contacts)
-	if !ok {
-		return fmt.Errorf("RPC: %#v", tl)
-	}
 
-	for _, v := range list.Users {
-		if v, ok := v.(mtproto.TL_user); ok {
-			cli.users[v.Id] = v
-		}
+	for _, v := range users {
+		cli.users[v.ID] = *v.TlUser
 	}
 
 	return nil
@@ -153,18 +143,16 @@ func (cli *TelegramCLI) LoadContacts() error {
 
 // Prints information about current user
 func (cli *TelegramCLI) CurrentUser() error {
-	userFull, err := cli.mtproto.UsersGetFullUsers(mtproto.TL_inputUserSelf{})
+	user, err := cli.mtproto.Users_GetFullSelf()
 	if err != nil {
 		return err
 	}
 
-	user := userFull.User.(mtproto.TL_user)
-	cli.users[user.Id] = user
+	cli.users[user.TlUser.Id] = *user.TlUser
 
-	message := fmt.Sprintf("You are logged in as: %s @%s %s\nId: %d\nPhone: %s\n", user.First_name, user.Username, user.Last_name, user.Id, user.Phone)
+	message := fmt.Sprintf("You are logged in as: %s @%s %s\nId: %d\nPhone: %s\n", user.FirstName, user.Username, user.LastName, user.ID, user.Phone)
 	fmt.Print(message)
 	log.Println(message)
-	log.Println(*userFull)
 
 	return nil
 }
@@ -227,133 +215,100 @@ UpdateCycle:
 }
 
 // Parse message and print to screen
-func (cli *TelegramCLI) parseMessage(message mtproto.TL) {
-	switch message.(type) {
-	case mtproto.TL_messageEmpty:
-		log.Println("Empty message")
-		log.Println(message)
-	case mtproto.TL_message:
-		log.Println("Got new message")
-		log.Println(message)
-		message, _ := message.(mtproto.TL_message)
-		var senderName string
-		from := message.From_id
-		userFrom, found := cli.users[from]
-		if !found {
-			log.Printf("Can't find user with id: %d", from)
-			senderName = fmt.Sprintf("%d unknow user", from)
-		}
-		senderName = nickname(userFrom)
-		toPeer := message.To_id
-		date := formatDate(message.Date)
+func (cli *TelegramCLI) parseMessage(message mtproto.Message) {
+	var senderName string
+	from := message.From
+	userFrom, found := cli.users[from]
+	if !found {
+		log.Printf("Can't find user with id: %d", from)
+		senderName = fmt.Sprintf("%d unknow user", from)
+	}
+	senderName = nickname(userFrom)
+	toPeer := message.To
+	date := formatDate(message.Date)
 
-		// Peer type
-		switch toPeer.(type) {
-		case mtproto.TL_peerUser:
-			peerUser := toPeer.(mtproto.TL_peerUser)
-			user, found := cli.users[peerUser.User_id]
-			if !found {
-				log.Printf("Can't find user with id: %d", peerUser.User_id)
-				// TODO: Get information about user from telegram server
-			}
-			peerName := nickname(user)
-			message := fmt.Sprintf("%s %d %s to %s: %s", date, message.Id, senderName, peerName, message.Message)
-			fmt.Println(message)
-		case mtproto.TL_peerChat:
-			peerChat := toPeer.(mtproto.TL_peerChat)
-			chat, found := cli.chats[peerChat.Chat_id]
-			if !found {
-				log.Printf("Can't find chat with id: %d", peerChat.Chat_id)
-			}
-			message := fmt.Sprintf("%s %d %s in %s(%d): %s", date, message.Id, senderName, chat.Title, chat.Id, message.Message)
-			fmt.Println(message)
-		case mtproto.TL_peerChannel:
-			peerChannel := toPeer.(mtproto.TL_peerChannel)
-			channel, found := cli.channels[peerChannel.Channel_id]
-			if !found {
-				log.Printf("Can't find channel with id: %d", peerChannel.Channel_id)
-			}
-			message := fmt.Sprintf("%s %d %s in %s(%d): %s", date, message.Id, senderName, channel.Title, channel.Id, message.Message)
-			fmt.Println(message)
-		default:
-			log.Printf("Unknown peer type: %T", toPeer)
-			log.Println(toPeer)
+	// Peer type
+	switch message.To.Type {
+	case mtproto.PEER_TYPE_USER:
+		user, found := cli.users[message.To.ID]
+		if !found {
+			log.Printf("Can't find user with id: %d", message.To.ID)
+			// TODO: Get information about user from telegram server
 		}
+		peerName := nickname(user)
+		fmt.Printf("%s %d %s to %s: %s\n", date, message.ID, senderName, peerName, message.Body)
+	case mtproto.PEER_TYPE_CHAT:
+		chat, found := cli.chats[message.To.ID]
+		if !found {
+			log.Printf("Can't find chat with id: %d", message.To.ID)
+		}
+		fmt.Printf("%s %d %s in %s(%d): %s\n", date, message.ID, senderName, chat.Title, chat.ID, message.Body)
+	case mtproto.PEER_TYPE_CHANNEL:
+		channel, found := cli.channels[message.To.ID]
+		if !found {
+			log.Printf("Can't find channel with id: %d", message.To.ID)
+		}
+		fmt.Printf("%s %d %s in %s(%d): %s", date, message.ID, senderName, channel.Title, channel.ID, message.Body)
 	default:
-		log.Printf("Unknown message type: %T", message)
-		log.Println(message)
+		log.Printf("Message `%v` with Unknown peer type: %v", message, toPeer)
 	}
 }
 
 // Works with mtproto.TL_updates_difference and mtproto.TL_updates_differenceSlice
-func (cli *TelegramCLI) parseUpdateDifference(users, messages, chats, updates []mtproto.TL) {
+func (cli *TelegramCLI) parseUpdateDifference(users []mtproto.User, messages []mtproto.Message, chats []mtproto.Chat, channels []mtproto.Channel, updates []mtproto.Update) {
 	// Process users
-	for _, it := range users {
-		user, ok := it.(mtproto.TL_user)
-		if !ok {
-			log.Println("Wrong user type: %T\n", it)
-		}
-		cli.users[user.Id] = user
+	for _, user := range users {
+		cli.users[(*user.TlUser).Id] = *user.TlUser
 	}
 	// Process chats
-	for _, it := range chats {
-		switch it.(type) {
-		case mtproto.TL_channel:
-			channel := it.(mtproto.TL_channel)
-			cli.channels[channel.Id] = channel
-		case mtproto.TL_chat:
-			chat := it.(mtproto.TL_chat)
-			cli.chats[chat.Id] = chat
-		default:
-			fmt.Printf("Wrong type: %T\n", it)
-		}
+	for _, chat := range chats {
+		cli.chats[chat.ID] = chat
+	}
+	// Process Channels
+	for _, channel := range channels {
+		cli.channels[channel.ID] = channel
 	}
 	// Process messages
 	for _, message := range messages {
 		cli.parseMessage(message)
 	}
 	// Process updates
-	for _, it := range updates {
-		switch it.(type) {
-		case mtproto.TL_updateNewMessage:
-			update := it.(mtproto.TL_updateNewMessage)
-			cli.parseMessage(update.Message)
-		case mtproto.TL_updateNewChannelMessage:
-			update := it.(mtproto.TL_updateNewChannelMessage)
-			cli.parseMessage(update.Message)
-		case mtproto.TL_updateEditMessage:
-			update := it.(mtproto.TL_updateEditMessage)
-			cli.parseMessage(update.Message)
-		case mtproto.TL_updateEditChannelMessage:
-			update := it.(mtproto.TL_updateNewChannelMessage)
-			cli.parseMessage(update.Message)
+	for _, update := range updates {
+		switch update.Type {
+		case mtproto.UPDATE_TYPE_NEW_MESSAGE:
+			cli.parseMessage(*update.Message)
+		case mtproto.UPDATE_TYPE_CHANNEL_NEW_MESSAGE:
+			cli.parseMessage(*update.Message)
+		case mtproto.UPDATE_TYPE_EDIT_MESSAGE:
+			cli.parseMessage(*update.Message)
+		case mtproto.UPDATE_TYPE_EDIT_CHANNEL_MESSAGE:
+			cli.parseMessage(*update.Message)
 		default:
-			log.Printf("Update type: %T\n", it)
-			log.Println(it)
+			log.Printf("Unhandled update type for update: %v\n", update)
 		}
 	}
 }
 
 // Parse update
-func (cli *TelegramCLI) parseUpdate(update mtproto.TL) {
-	switch update.(type) {
-	case mtproto.TL_updates_differenceEmpty:
-		diff, _ := update.(mtproto.TL_updates_differenceEmpty)
-		cli.state.Date = diff.Date
-		cli.state.Seq = diff.Seq
-	case mtproto.TL_updates_difference:
-		diff, _ := update.(mtproto.TL_updates_difference)
-		state, _ := diff.State.(mtproto.TL_updates_state)
-		cli.state = &state
-		cli.parseUpdateDifference(diff.Users, diff.New_messages, diff.Chats, diff.Other_updates)
-	case mtproto.TL_updates_differenceSlice:
-		diff, _ := update.(mtproto.TL_updates_differenceSlice)
-		state, _ := diff.Intermediate_state.(mtproto.TL_updates_state)
-		cli.state = &state
-		cli.parseUpdateDifference(diff.Users, diff.New_messages, diff.Chats, diff.Other_updates)
-	case mtproto.TL_updates_differenceTooLong:
-		diff, _ := update.(mtproto.TL_updates_differenceTooLong)
-		cli.state.Pts = diff.Pts
+func (cli *TelegramCLI) parseUpdate(update mtproto.UpdateDifference) {
+	if (update.Type == mtproto.UPDATE_DIFFERENCE_EMPTY) {
+		cli.state.Date = update.IntermediateState.Date
+		cli.state.Seq = update.IntermediateState.Seq
+		return
+	}
+	if (update.TlUpdatesDifference != nil) {
+		cli.state = update.IntermediateState.TlUpdatesState
+		cli.parseUpdateDifference(update.Users, update.NewMessages, update.Chats, update.Channels, update.OtherUpdates)
+		return
+	}
+	if (update.Type == mtproto.UPDATE_DIFFERENCE_SLICE) {
+		cli.state = update.IntermediateState.TlUpdatesState
+		cli.parseUpdateDifference(update.Users, update.NewMessages, update.Chats, update.Channels, update.OtherUpdates)
+		return
+	}
+	if (update.Type == mtproto.UPDATE_DIFFERENCE_TOO_LONG) {
+		cli.state.Pts = update.IntermediateState.Pts
+		return
 	}
 }
 
@@ -362,27 +317,23 @@ func (cli *TelegramCLI) processUpdates() {
 	if cli.connected {
 		if cli.state == nil {
 			log.Println("cli.state is nil. Trying to get actual state...")
-			tl, err := cli.mtproto.UpdatesGetState()
+			tl, err := cli.mtproto.Updates_GetState()
 			if err != nil {
 				log.Fatal(err)
 			}
 			log.Println("Got something")
 			log.Println(*tl)
-			state, ok := (*tl).(mtproto.TL_updates_state)
-			if !ok {
-				err := fmt.Errorf("Failed to get current state: API returns wrong type: %T", *tl)
-				log.Fatal(err)
-			}
-			cli.state = &state
+
+			cli.state = tl.TlUpdatesState
 			return
 		}
-		tl, err := cli.mtproto.UpdatesGetDifference(cli.state.Pts, cli.state.Unread_count, cli.state.Date, cli.state.Qts)
+		tl, err := cli.mtproto.Updates_GetDifference(cli.state.Pts, cli.state.Qts, cli.state.Date)
 		if err != nil {
 			log.Println(err)
 			return
 		}
 		log.Println("Got new update")
-		log.Println(*tl)
+		log.Println(tl)
 		cli.parseUpdate(*tl)
 		return
 	}
@@ -390,37 +341,25 @@ func (cli *TelegramCLI) processUpdates() {
 
 // Print contact list
 func (cli *TelegramCLI) Contacts() error {
-	tl, err := cli.mtproto.ContactsGetContacts("")
+	contacts, _, err := cli.mtproto.Contacts_GetContacts(0)
 	if err != nil {
 		return err
 	}
-	list, ok := (*tl).(mtproto.TL_contacts_contacts)
-	if !ok {
-		return fmt.Errorf("RPC: %#v", tl)
-	}
 
-	contacts := make(map[int32]mtproto.TL_user)
-	for _, v := range list.Users {
-		if v, ok := v.(mtproto.TL_user); ok {
-			contacts[v.Id] = v
-		}
+	contactsMap := make(map[int32]mtproto.Contact)
+	for _, contact := range contacts {
+		contactsMap[contact.UserID] = contact
 	}
 	fmt.Printf(
-		"\033[33m\033[1m%10s    %10s    %-30s    %-20s\033[0m\n",
-		"id", "mutual", "name", "username",
+		"\033[33m\033[1m%10s    %10s    %-30s\033[0m\n",
+		"id", "mutual", "name",
 	)
-	for _, v := range list.Contacts {
-		v := v.(mtproto.TL_contact)
-		mutual, err := mtproto.ToBool(v.Mutual)
-		if err != nil {
-			return err
-		}
+	for _, contact := range contacts {
 		fmt.Printf(
 			"%10d    %10t    %-30s    %-20s\n",
-			v.User_id,
-			mutual,
-			fmt.Sprintf("%s %s", contacts[v.User_id].First_name, contacts[v.User_id].Last_name),
-			contacts[v.User_id].Username,
+			contact.UserID,
+			contact.Mutual,
+			fmt.Sprintf("%s %s", contacts[contact.UserID].Firstname, contacts[contact.UserID].Lastname),
 		)
 	}
 
@@ -456,8 +395,9 @@ func (cli *TelegramCLI) RunCommand(command *Command) error {
 			fmt.Println(info)
 			return nil
 		}
-		update, err := cli.mtproto.MessagesSendMessage(false, false, false, true, mtproto.TL_inputPeerUser{User_id: user.Id, Access_hash: user.Access_hash}, 0, args[1], rand.Int63(), mtproto.TL_null{}, nil)
-		cli.parseUpdate(*update)
+		update, err := cli.mtproto.Messages_SendMessage(args[1], mtproto.TL_inputPeerUser{User_id: user.Id, Access_hash: user.Access_hash}, 0)
+		fmt.Printf("umsg: SendMessage Returned: %v\n", update)
+		//cli.parseUpdate(*update)
 	case "cmsg":
 		if command.Arguments == "" {
 			return errors.New("Not enough arguments: peer id and msg required")
@@ -470,8 +410,9 @@ func (cli *TelegramCLI) RunCommand(command *Command) error {
 		if err != nil {
 			return fmt.Errorf("Wrong arguments: %s isn't a number", args[0])
 		}
-		update, err := cli.mtproto.MessagesSendMessage(false, false, false, true, mtproto.TL_inputPeerChat{Chat_id: int32(id)}, 0, args[1], rand.Int63(), mtproto.TL_null{}, nil)
-		cli.parseUpdate(*update)
+		update, err := cli.mtproto.Messages_SendMessage(args[1], mtproto.TL_inputPeerChat{Chat_id: int32(id)}, 0)
+		fmt.Printf("cmsg: SendMessage Returned: %v\n", update)
+		//cli.parseUpdate(*update)
 	case "help":
 		help()
 	case "quit":
@@ -491,11 +432,31 @@ func main() {
 	}
 	defer logfile.Close()
 
+	appId, _ := strconv.ParseUint(os.Getenv("TELEGRAM_APP_ID"), 10, 32)
+	if (appId < 1) {
+		log.Fatalf("couldn't parse appId in $TELEGRAM_APP_ID: `%s`", os.Getenv("TELEGRAM_APP_ID"))
+	}
+
+	apiHash := os.Getenv("TELEGRAM_API_HASH")
+	if (apiHash == "") {
+		log.Fatalf("couldn't parse apiHash in $TELEGRAM_API_HASH: `%s`", os.Getenv("TELEGRAM_API_HASH"))
+	}
+
+	authFile := os.Getenv("TELEGRAM_AUTH_FILE")
+	if (authFile == "") {
+		dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+		if err != nil {
+			log.Fatal(err)
+		}
+		authFile = dir + "/telegram.auth"
+		fmt.Println("Using auth file: " + authFile)
+	}
+
 	log.SetOutput(logfile)
 	log.Println("Program started")
 
 	// LoadContacts
-	mtproto, err := mtproto.NewMTProto(41994, "269069e15c81241f5670c397941016a2", mtproto.WithAuthFile(os.Getenv("HOME")+"/.telegramgo", false))
+	mtproto, err := mtproto.NewMTProto(int64(appId), apiHash, authFile, "", 0x01)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -513,7 +474,7 @@ func main() {
 		fmt.Scanln(&phonenumber)
 		err := telegramCLI.Authorization(phonenumber)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("Failed authorization", err)
 		}
 	}
 	if err := telegramCLI.LoadContacts(); err != nil {
