@@ -66,8 +66,12 @@ func help() {
 	fmt.Println("Available commands:")
 	fmt.Println("\\me - Shows information about current account")
 	fmt.Println("\\contacts - Shows contacts list")
+	fmt.Println("\\chats - Shows chats & channels list")
+	fmt.Println("\\dialogs - Shows dialogs list")
 	fmt.Println("\\umsg <id> <message> - Sends message to user with <id>")
 	fmt.Println("\\cmsg <id> <message> - Sends message to chat with <id>")
+	fmt.Println("\\uhist <id> <limit> - Gets last <limit> messages with user <id>")
+	fmt.Println("\\chist <id> <limit> - Gets last <limit> messages in chat with <id>")
 	fmt.Println("\\help - Shows this message")
 	fmt.Println("\\quit - Quit")
 }
@@ -82,6 +86,9 @@ type TelegramCLI struct {
 	users     map[int32]mtproto.TL_user
 	chats     map[int32]mtproto.Chat
 	channels  map[int32]mtproto.Channel
+	dialogs     map[string]map[int32]mtproto.Dialog
+	contacts  map[int32]mtproto.Contact
+	contactUsers  map[int32]mtproto.User
 }
 
 func NewTelegramCLI(pMTProto *mtproto.MTProto) (*TelegramCLI, error) {
@@ -96,6 +103,9 @@ func NewTelegramCLI(pMTProto *mtproto.MTProto) (*TelegramCLI, error) {
 	cli.users = make(map[int32]mtproto.TL_user)
 	cli.chats = make(map[int32]mtproto.Chat)
 	cli.channels = make(map[int32]mtproto.Channel)
+	cli.dialogs = make(map[string]map[int32]mtproto.Dialog)
+	cli.contacts = make(map[int32]mtproto.Contact)
+	cli.contactUsers = make(map[int32]mtproto.User)
 
 	return cli, nil
 }
@@ -129,14 +139,96 @@ func (cli *TelegramCLI) Authorization(phonenumber string) error {
 
 // Load contacts to users map
 func (cli *TelegramCLI) LoadContacts() error {
-	_, users, err := cli.mtproto.Contacts_GetContacts(0)
+	contacts, users, err := cli.mtproto.Contacts_GetContacts(0)
 	if err != nil {
 		return err
 	}
 
-	for _, v := range users {
-		cli.users[v.ID] = *v.TlUser
+	for _, contact := range contacts {
+		cli.contacts[contact.UserID] = contact
 	}
+	for _, user := range users {
+		cli.contactUsers[user.ID] = user
+		cli.users[user.ID] = *user.TlUser
+	}
+
+	fmt.Printf("Loaded %d contacts and %d contactUsers\n", len(contacts), len(users))
+
+	return nil
+}
+
+func (cli *TelegramCLI) LoadChannels() error {
+	channelTls := make([]mtproto.TL, len(cli.channels))
+	i := 0
+	for channelId := range cli.channels {
+		channelTls[i] = mtproto.TL_inputChannel{
+				Channel_id:  channelId,
+				Access_hash: cli.channels[channelId].AccessHash,
+			}
+		i++
+	}
+
+	channels, err := cli.mtproto.Channels_GetChannels(channelTls)
+	if err != nil {
+		return err
+	}
+
+	for _, channel := range channels {
+		cli.channels[channel.ID] = channel
+	}
+
+	fmt.Printf("Loaded %d channels\n", len(channels))
+
+	return nil
+}
+
+func (cli *TelegramCLI) LoadChats() error {
+	chatIds := make([]int32, len(cli.chats))
+	i := 0
+	for k := range cli.chats {
+    chatIds[i] = k
+    i++
+	}
+
+	chats, err := cli.mtproto.Messages_GetChats(chatIds)
+	if err != nil {
+		return err
+	}
+
+	for _, chat := range chats {
+		cli.chats[chat.ID] = chat
+	}
+
+	fmt.Printf("Loaded %d chats\n", len(chats))
+
+	return nil
+}
+
+
+func (cli *TelegramCLI) LoadDialogs() error {
+	dialogs, _, err := cli.mtproto.Messages_GetDialogs(0, 0, 10000, mtproto.TL_inputPeerEmpty{})
+	if err != nil {
+		return err
+	}
+
+	for _, dialog := range dialogs {
+		if cli.dialogs[dialog.Type] == nil {
+			cli.dialogs[dialog.Type] = make(map[int32]mtproto.Dialog)
+		}
+
+		cli.dialogs[dialog.Type][dialog.PeerID] = dialog
+
+		switch dialog.Type {
+		case mtproto.DIALOG_TYPE_CHAT:
+			cli.chats[dialog.Chat.ID] = *dialog.Chat
+		case mtproto.DIALOG_TYPE_USER:
+			cli.users[dialog.User.ID] = *(*dialog.User).TlUser
+		case mtproto.DIALOG_TYPE_CHANNEL:
+			cli.channels[dialog.Channel.ID] = *dialog.Channel
+		}
+	}
+
+	fmt.Printf("Loaded %d dialogs\n", len(dialogs))
 
 	return nil
 }
@@ -341,25 +433,105 @@ func (cli *TelegramCLI) processUpdates() {
 
 // Print contact list
 func (cli *TelegramCLI) Contacts() error {
-	contacts, _, err := cli.mtproto.Contacts_GetContacts(0)
+	err := cli.LoadContacts()
 	if err != nil {
 		return err
 	}
 
-	contactsMap := make(map[int32]mtproto.Contact)
-	for _, contact := range contacts {
-		contactsMap[contact.UserID] = contact
-	}
+
 	fmt.Printf(
 		"\033[33m\033[1m%10s    %10s    %-30s\033[0m\n",
 		"id", "mutual", "name",
 	)
-	for _, contact := range contacts {
+
+	for _, contact := range cli.contacts {
+		name := ""
+		if cu, ok := cli.contactUsers[contact.UserID]; ok {
+			name = fmt.Sprintf("%s %s (@%s)", cu.FirstName, cu.LastName, cu.Username)
+		}
 		fmt.Printf(
-			"%10d    %10t    %-30s    %-20s\n",
+			"%10d    %10t    %-30s\n",
 			contact.UserID,
 			contact.Mutual,
-			fmt.Sprintf("%s %s", contacts[contact.UserID].Firstname, contacts[contact.UserID].Lastname),
+			name,
+		)
+	}
+
+	return nil
+}
+
+func (cli *TelegramCLI) Dialogs() error {
+	err := cli.LoadDialogs()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Dialogs:\n")
+
+	fmt.Printf(
+		"\033[33m\033[1m%10s    %10s    %10s    %-30s\033[0m\n",
+		"type", "unreadCount", "peerId", "topMessage",
+	)
+
+	for _, dialogsOfType := range cli.dialogs {
+		for _, dialog := range dialogsOfType {
+			msg := ""
+			if dialog.TopMessage != nil {
+				msg = strings.Replace(dialog.TopMessage.Body, "\n", "\\", -1)
+			}
+			fmt.Printf(
+				"%10s    %10d    %10d    %-.30s\n",
+				dialog.Type,
+				dialog.UnreadCount,
+				dialog.PeerID,
+				msg,
+			)
+		}
+	}
+
+	return nil
+}
+
+func (cli *TelegramCLI) ChatsAndChannels() error {
+	err := cli.LoadChannels()
+	if err != nil {
+		return err
+	}
+	err = cli.LoadChats()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%d Chats:\n", len(cli.chats))
+
+	fmt.Printf(
+		"\033[33m\033[1m%10s    %10s    %10s    %-30s\033[0m\n",
+		"id", "memberCount", "username", "title",
+	)
+
+	for _, chat := range cli.chats {
+		fmt.Printf(
+			"%10d    %10d    %10s    %-30s\n",
+			chat.ID,
+			len(chat.Members),
+			chat.Username,
+			chat.Title,
+		)
+	}
+
+	fmt.Printf("%d Channels:\n", len(cli.channels))
+
+	fmt.Printf(
+		"\033[33m\033[1m%10s    %10s    %-30s\033[0m\n",
+		"id", "username", "title",
+	)
+
+	for _, channel := range cli.channels {
+		fmt.Printf(
+			"%10d    %10t    %-30s\n",
+			channel.ID,
+			channel.Username,
+			channel.Title,
 		)
 	}
 
@@ -375,6 +547,14 @@ func (cli *TelegramCLI) RunCommand(command *Command) error {
 		}
 	case "contacts":
 		if err := cli.Contacts(); err != nil {
+			return err
+		}
+	case "chats":
+		if err := cli.ChatsAndChannels(); err != nil {
+			return err
+		}
+	case "dialogs":
+		if err := cli.Dialogs(); err != nil {
 			return err
 		}
 	case "umsg":
@@ -395,7 +575,9 @@ func (cli *TelegramCLI) RunCommand(command *Command) error {
 			fmt.Println(info)
 			return nil
 		}
-		update, err := cli.mtproto.Messages_SendMessage(args[1], mtproto.TL_inputPeerUser{User_id: user.Id, Access_hash: user.Access_hash}, 0)
+		userInfo := mtproto.TL_inputPeerUser{User_id: user.Id, Access_hash: user.Access_hash}
+		// userInfo := mtproto.TL_inputPeerSelf{}
+		update, err := cli.mtproto.Messages_SendMessage(args[1], userInfo, 0)
 		fmt.Printf("umsg: SendMessage Returned: %v\n", update)
 		//cli.parseUpdate(*update)
 	case "cmsg":
@@ -412,6 +594,59 @@ func (cli *TelegramCLI) RunCommand(command *Command) error {
 		}
 		update, err := cli.mtproto.Messages_SendMessage(args[1], mtproto.TL_inputPeerChat{Chat_id: int32(id)}, 0)
 		fmt.Printf("cmsg: SendMessage Returned: %v\n", update)
+		//cli.parseUpdate(*update)
+	case "uhist":
+		if command.Arguments == "" {
+			return errors.New("Not enough arguments: peer id and limit required")
+		}
+		args := strings.SplitN(command.Arguments, " ", 2)
+		if len(args) < 2 {
+			return errors.New("Not enough arguments: peer id and limit required")
+		}
+		id, err := strconv.Atoi(args[0])
+		if err != nil {
+			return fmt.Errorf("Wrong arguments: %s isn't a number", args[0])
+		}
+		user, found := cli.users[int32(id)]
+		if !found {
+			info := fmt.Sprintf("Can't find user with id: %d", id)
+			fmt.Println(info)
+			return nil
+		}
+		limit, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("Wrong arguments: %s isn't a number", args[1])
+		}
+		userInfo := mtproto.TL_inputPeerUser{User_id: user.Id, Access_hash: user.Access_hash}
+		// userInfo := mtproto.TL_inputPeerSelf{}
+		messages, count := cli.mtproto.Messages_GetHistory(userInfo, int32(limit), 0, 0)
+		for _, message := range messages {
+			cli.parseMessage(message)
+		}
+		fmt.Printf("uhist: GetHistory Returned %d messages\n", count)
+		//cli.parseUpdate(*update)
+	case "chist":
+		if command.Arguments == "" {
+			return errors.New("Not enough arguments: peer id and limit required")
+		}
+		args := strings.SplitN(command.Arguments, " ", 2)
+		if len(args) < 2 {
+			return errors.New("Not enough arguments: peer id and limit required")
+		}
+		id, err := strconv.Atoi(args[0])
+		if err != nil {
+			return fmt.Errorf("Wrong arguments: %s isn't a number", args[0])
+		}
+		limit, err := strconv.Atoi(args[1])
+		if err != nil {
+			return fmt.Errorf("Wrong arguments: %s isn't a number", args[1])
+		}
+		chatInfo := mtproto.TL_inputPeerChat{Chat_id: int32(id)}
+		messages, count := cli.mtproto.Messages_GetHistory(chatInfo, int32(limit), 0, 0)
+		for _, message := range messages {
+			cli.parseMessage(message)
+		}
+		fmt.Printf("chist: GetHistory Returned %d messages\n", count)
 		//cli.parseUpdate(*update)
 	case "help":
 		help()
@@ -442,6 +677,8 @@ func main() {
 		log.Fatalf("couldn't parse apiHash in $TELEGRAM_API_HASH: `%s`", os.Getenv("TELEGRAM_API_HASH"))
 	}
 
+	dcAddress := os.Getenv("TELEGRAM_DC")
+
 	authFile := os.Getenv("TELEGRAM_AUTH_FILE")
 	if (authFile == "") {
 		dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
@@ -456,7 +693,7 @@ func main() {
 	log.Println("Program started")
 
 	// LoadContacts
-	mtproto, err := mtproto.NewMTProto(int64(appId), apiHash, authFile, "", 0x01)
+	mtproto, err := mtproto.NewMTProto(int64(appId), apiHash, authFile, dcAddress, mtproto.DEBUG_LEVEL_NETWORK)
 	if err != nil {
 		log.Fatal(err)
 	}
